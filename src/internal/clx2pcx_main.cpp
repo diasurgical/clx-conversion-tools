@@ -15,10 +15,10 @@
 
 #include <clx2pixels.hpp>
 #include <dvl_gfx_common.hpp>
-#include <dvl_gfx_embedded_palettes.h>
 #include <pcx_encode.hpp>
 
 #include "argument_parser.hpp"
+#include "palette.hpp"
 #include "tl/expected.hpp"
 
 namespace dvl_gfx {
@@ -35,8 +35,6 @@ Options:
   --remove                     Remove the input files.
   -q, --quiet                  Do not log anything.
 )";
-
-constexpr size_t PaletteSize = 768;
 
 struct Options {
 	std::vector<const char *> inputPaths;
@@ -98,34 +96,6 @@ tl::expected<Options, ArgumentError> ParseArguments(int argc, char *argv[])
 	return options;
 }
 
-std::optional<IoError> LoadPalette(std::string_view path, std::array<uint8_t, PaletteSize> &palette)
-{
-	std::error_code ec;
-	const uintmax_t size = std::filesystem::file_size(path, ec);
-	if (ec)
-		return IoError { ec.message() };
-	if (size != PaletteSize)
-		return IoError { "Palette file must be exactly 768 bytes." };
-	std::ifstream input;
-	input.open(std::string(path).c_str(), std::ios::in | std::ios::binary);
-	if (input.fail())
-		return IoError { std::string("Failed to open palette file: ")
-			                 .append(std::strerror(errno)) };
-	input.read(reinterpret_cast<char *>(palette.data()), PaletteSize);
-	if (input.fail()) {
-		return IoError {
-			std::string("Failed to read palette file: ").append(std::strerror(errno))
-		};
-	}
-	input.close();
-	if (input.fail()) {
-		return IoError {
-			std::string("Failed to close palette file: ").append(std::strerror(errno))
-		};
-	}
-	return std::nullopt;
-}
-
 std::optional<IoError> Run(const Options &options)
 {
 	if (!options.quiet) {
@@ -137,16 +107,8 @@ std::optional<IoError> Run(const Options &options)
 		outputDirFs = *options.outputDir;
 
 	std::array<uint8_t, PaletteSize> palette;
-	if (options.palette == "default") {
-		std::memcpy(palette.data(), dvl_gfx_embedded_default_pal_data, dvl_gfx_embedded_default_pal_size);
-	} else if (options.palette == "diablo_menu") {
-		std::memcpy(palette.data(), dvl_gfx_embedded_diablo_menu_pal_data, dvl_gfx_embedded_diablo_menu_pal_size);
-	} else if (options.palette == "hellfire_menu") {
-		std::memcpy(palette.data(), dvl_gfx_embedded_hellfire_menu_pal_data, dvl_gfx_embedded_hellfire_menu_pal_size);
-	} else {
-		if (std::optional<IoError> error = LoadPalette(options.palette, palette); error.has_value()) {
-			return error;
-		}
+	if (std::optional<IoError> error = LoadPalette(options.palette, palette); error.has_value()) {
+		return error;
 	}
 
 	std::vector<uint8_t> pixels;

@@ -5,6 +5,18 @@ project(DvlGfx VERSION 1.0.0 LANGUAGES C CXX)
 option(ASAN "Enable address sanitizer" ON)
 option(UBSAN "Enable undefined behaviour sanitizer" ON)
 option(ENABLE_INSTALL "Enable install targets" ON)
+option(ENABLE_PNG_TOOLS "Build png2clx and clx2png" ON)
+option(USE_SYSTEM_LIBPNG "Use system libpng instead of fetching it and linking it statically" OFF)
+include(CMakeDependentOption)
+cmake_dependent_option(USE_SYSTEM_ZLIB "Use system zlib for the fetched libpng instead of fetching it and linking it statically" OFF
+  "ENABLE_PNG_TOOLS;NOT USE_SYSTEM_LIBPNG" OFF)
+
+if(POLICY CMP0135)
+  # Set the timestamps of files extracted by FetchContent to the time of extraction.
+  cmake_policy(SET CMP0135 NEW)
+endif()
+
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
 
@@ -155,7 +167,38 @@ target_link_libraries(clx2pixels PUBLIC common clx_decode)
 set_target_properties(clx2pixels PROPERTIES PUBLIC_HEADER "src/public/include/clx2pixels.hpp")
 target_include_directories(clx2pixels PRIVATE src/internal)
 
-foreach(_target cel2clx_main cl22clx_main clx2pcx_main pcx2clx_main)
+set(_executables cel2clx_main cl22clx_main clx2pcx_main pcx2clx_main)
+
+if(ENABLE_PNG_TOOLS)
+  if(USE_SYSTEM_LIBPNG)
+    find_package(PNG REQUIRED)
+  else()
+    if(USE_SYSTEM_ZLIB)
+      find_package(ZLIB REQUIRED)
+    else()
+      add_subdirectory(third_party/zlib)
+    endif()
+    add_subdirectory(third_party/libpng)
+  endif()
+
+  add_library(png_codec STATIC src/internal/png_codec.cpp)
+  target_link_libraries(png_codec PUBLIC common PRIVATE PNG::PNG)
+  target_include_directories(png_codec PRIVATE src/internal)
+
+  add_executable(png2clx_main src/internal/png2clx_main.cpp)
+  set_property(TARGET png2clx_main PROPERTY RUNTIME_OUTPUT_NAME png2clx)
+  target_link_libraries(png2clx_main PRIVATE png_codec pixels2clx)
+  target_include_directories(png2clx_main PRIVATE src/internal)
+
+  add_executable(clx2png_main src/internal/clx2png_main.cpp)
+  set_property(TARGET clx2png_main PROPERTY RUNTIME_OUTPUT_NAME clx2png)
+  target_link_libraries(clx2png_main PRIVATE png_codec clx2pixels dvl_gfx_embedded_palettes)
+  target_include_directories(clx2png_main PRIVATE src/internal)
+
+  list(APPEND _executables png2clx_main clx2png_main)
+endif()
+
+foreach(_target ${_executables})
   if(ASAN)
     target_compile_options(${_target} PUBLIC -fsanitize=address -fsanitize-recover=address)
     target_link_libraries(${_target} PUBLIC -fsanitize=address -fsanitize-recover=address)
@@ -180,7 +223,7 @@ if(ENABLE_INSTALL)
     COMPONENT Development
   )
   install(
-    TARGETS cel2clx_main cl22clx_main clx2pcx_main pcx2clx_main
+    TARGETS ${_executables}
     CONFIGURATIONS Release
     COMPONENT Binaries
   )
