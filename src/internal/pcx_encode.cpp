@@ -18,6 +18,14 @@ namespace dvl_gfx {
 namespace {
 
 /**
+ * @brief The PCX specification requires the number of bytes per scanline to be even.
+ */
+uint16_t PcxBytesPerLine(int16_t width)
+{
+	return static_cast<uint16_t>(width + (width % 2));
+}
+
+/**
  * @brief Write the PCX-file header
  * @param width Image width
  * @param height Image height
@@ -37,7 +45,7 @@ bool CaptureHdr(int16_t width, int16_t height, std::ostream *out)
 	buffer.hDpi = SwapLE(width);
 	buffer.vDpi = SwapLE(height);
 	buffer.nPlanes = 1;
-	buffer.bytesPerLine = SwapLE(width);
+	buffer.bytesPerLine = SwapLE(PcxBytesPerLine(width));
 	out->write(reinterpret_cast<const char *>(&buffer), sizeof(buffer));
 	return !out->fail();
 }
@@ -76,11 +84,7 @@ uint8_t *CaptureEnc(const uint8_t *src, uint8_t *dst, int width)
 
 		width--;
 
-		while (rlePixel == *src) {
-			if (rleLength >= 63)
-				break;
-			if (width == 0)
-				break;
+		while (width > 0 && rleLength < 63 && rlePixel == *src) {
 			rleLength++;
 
 			width--;
@@ -109,10 +113,14 @@ uint8_t *CaptureEnc(const uint8_t *src, uint8_t *dst, int width)
 bool CapturePix(std::span<const uint8_t> pixels, Size size, uint32_t pitch, std::ostream *out)
 {
 	const int width = size.width;
-	std::unique_ptr<uint8_t[]> pBuffer { new uint8_t[2 * width] };
+	const int bytesPerLine = PcxBytesPerLine(width);
+	std::unique_ptr<uint8_t[]> lineBuffer { new uint8_t[bytesPerLine] };
+	std::memset(lineBuffer.get(), 0, bytesPerLine);
+	std::unique_ptr<uint8_t[]> pBuffer { new uint8_t[2 * bytesPerLine] };
 	const uint8_t *lineBegin = pixels.data();
 	for (int height = size.height; height > 0; height--) {
-		const uint8_t *pBufferEnd = CaptureEnc(lineBegin, pBuffer.get(), width);
+		std::memcpy(lineBuffer.get(), lineBegin, width);
+		const uint8_t *pBufferEnd = CaptureEnc(lineBuffer.get(), pBuffer.get(), bytesPerLine);
 		lineBegin += pitch;
 		out->write(reinterpret_cast<const char *>(pBuffer.get()), pBufferEnd - pBuffer.get());
 		if (out->fail())

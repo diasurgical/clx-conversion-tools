@@ -1,7 +1,6 @@
 #include <pcx2clx.hpp>
 
 #include <array>
-#include <cassert>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
@@ -27,21 +26,37 @@ std::optional<IoError> PcxToClx(const uint8_t *data, size_t size,
 	int width;
 	int height;
 	uint8_t bpp;
+	uint8_t numPlanes;
+	unsigned bytesPerLine;
 	if (size < PcxHeaderSize) {
 		return IoError { "data too small" };
 	}
-	const uint8_t *pixelData = LoadPcxMeta(data, width, height, bpp);
+	const uint8_t *pixelData = LoadPcxMeta(data, width, height, bpp, numPlanes, bytesPerLine);
+	const uint8_t *const dataEnd = data + size;
 	const size_t pixelDataSize = size - PcxHeaderSize;
-	assert(bpp == 8);
+	if (bpp != 8 || numPlanes != 1)
+		return IoError { "Only 8-bit single-plane PCX images are supported" };
+	if (width <= 0 || height <= 0)
+		return IoError { "Invalid PCX image dimensions" };
+	if (bytesPerLine < static_cast<unsigned>(width))
+		return IoError { "Invalid PCX header: bytes per line is less than the image width" };
 
 	unsigned numFrames;
 	unsigned frameHeight;
 	if (numFramesOrFrameHeight > 0) {
 		numFrames = numFramesOrFrameHeight;
 		frameHeight = height / numFrames;
-	} else {
+	} else if (numFramesOrFrameHeight < 0) {
 		frameHeight = -numFramesOrFrameHeight;
 		numFrames = height / frameHeight;
+	} else {
+		return IoError { "The number of frames must not be 0" };
+	}
+	if (numFrames == 0 || frameHeight == 0)
+		return IoError { "Image is too small for the requested frame size or count" };
+	for (const uint16_t cropWidth : cropWidths) {
+		if (cropWidth > width)
+			return IoError { "Crop width is larger than the image width" };
 	}
 
 	// CLX header: frame count, frame offset for each frame, file size
@@ -54,7 +69,10 @@ std::optional<IoError> PcxToClx(const uint8_t *data, size_t size,
 	auto frameBuffer = std::unique_ptr<uint8_t[]>(
 	    new uint8_t[static_cast<size_t>(frameHeight) * width]);
 
-	const unsigned srcSkip = width % 2;
+	// Each scanline is `bytesPerLine` bytes long, which can be larger than the width
+	// (the PCX specification requires `bytesPerLine` to be even).
+	auto lineBuffer = std::unique_ptr<uint8_t[]>(new uint8_t[bytesPerLine]);
+
 	const uint8_t *dataPtr = pixelData;
 	for (unsigned frame = 1; frame <= numFrames; ++frame) {
 		WriteLE32(&clxData[4 * static_cast<size_t>(frame)],
@@ -78,22 +96,25 @@ std::optional<IoError> PcxToClx(const uint8_t *data, size_t size,
 		WriteLE16(&clxData[frameHeaderPos + 4], static_cast<uint16_t>(frameHeight));
 
 		for (unsigned j = 0; j < frameHeight; ++j) {
-			uint8_t *buffer = &frameBuffer[static_cast<size_t>(j) * width];
-			for (unsigned x = 0; x < static_cast<unsigned>(width);) {
+			for (unsigned x = 0; x < bytesPerLine;) {
+				if (dataPtr == dataEnd)
+					return IoError { "PCX pixel data is truncated" };
 				constexpr uint8_t PcxMaxSinglePixel = 0xBF;
 				const uint8_t byte = *dataPtr++;
 				if (byte <= PcxMaxSinglePixel) {
-					*buffer++ = byte;
-					++x;
+					lineBuffer[x++] = byte;
 					continue;
 				}
+				if (dataPtr == dataEnd)
+					return IoError { "PCX pixel data is truncated" };
 				constexpr uint8_t PcxRunLengthMask = 0x3F;
 				const uint8_t runLength = (byte & PcxRunLengthMask);
-				std::memset(buffer, *dataPtr++, runLength);
-				buffer += runLength;
+				if (runLength > bytesPerLine - x)
+					return IoError { "PCX run crosses a scanline boundary" };
+				std::memset(&lineBuffer[x], *dataPtr++, runLength);
 				x += runLength;
 			}
-			dataPtr += srcSkip;
+			std::memcpy(&frameBuffer[static_cast<size_t>(j) * width], lineBuffer.get(), width);
 		}
 
 		unsigned transparentRunWidth = 0;
@@ -122,7 +143,7 @@ std::optional<IoError> PcxToClx(const uint8_t *data, size_t size,
 					AppendClxPixelsOrFillRun(src - solidRunWidth, solidRunWidth, clxData);
 				}
 			} else {
-				AppendClxPixelsOrFillRun(src, width, clxData);
+				AppendClxPixelsOrFillRun(src, frameWidth, clxData);
 			}
 			++line;
 		}
@@ -132,7 +153,13 @@ std::optional<IoError> PcxToClx(const uint8_t *data, size_t size,
 	    static_cast<uint32_t>(clxData.size()));
 
 	if (paletteData != nullptr) {
+		// The 256-color palette is stored at the end of the file:
+		// a separator byte followed by 256 RGB triplets.
 		constexpr unsigned PcxPaletteSeparator = 0x0C;
+		constexpr size_t PcxPaletteSize = 1 + 256 * 3;
+		if (static_cast<size_t>(dataEnd - dataPtr) < PcxPaletteSize)
+			return IoError { std::string("PCX has no palette") };
+		dataPtr = dataEnd - PcxPaletteSize;
 		if (*dataPtr++ != PcxPaletteSeparator)
 			return IoError { std::string("PCX has no palette") };
 

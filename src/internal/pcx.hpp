@@ -28,6 +28,14 @@ struct PCXHeader {
 
 inline constexpr size_t PcxHeaderSize = 128;
 
-const uint8_t *LoadPcxMeta(const uint8_t *data, int &width, int &height, uint8_t &bpp);
+/**
+ * @brief Reads the PCX header.
+ *
+ * @param data PCX data, at least `PcxHeaderSize` bytes.
+ * @param bytesPerLine The size of each decoded scanline (per plane), including padding.
+ * @return Pointer to the start of the pixel data.
+ */
+const uint8_t *LoadPcxMeta(const uint8_t *data, int &width, int &height, uint8_t &bpp,
+    uint8_t &numPlanes, unsigned &bytesPerLine);
 
 } // namespace dvl_gfx
