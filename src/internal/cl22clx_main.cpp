@@ -73,7 +73,7 @@ tl::expected<Options, ArgumentError> ParseArguments(int argc, char *argv[])
 				return tl::unexpected { std::move(value).error() };
 			options.outputFilename = *value;
 		} else if (arg == "--width") {
-			tl::expected<std::vector<uint16_t>, ArgumentError> value = ParseIntListArgument<uint16_t>(state);
+			tl::expected<std::vector<uint16_t>, ArgumentError> value = ParseIntListArgument<uint16_t>(state, 1);
 			if (!value.has_value())
 				return tl::unexpected { std::move(value).error() };
 			options.widths = *std::move(value);

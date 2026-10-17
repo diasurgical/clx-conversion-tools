@@ -5,7 +5,10 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <memory>
+#include <optional>
+#include <string>
 #include <vector>
 
 #include <clx_decode.hpp>
@@ -39,25 +42,153 @@ constexpr uint8_t GetCl2OpaqueFillWidth(uint8_t control)
 	return static_cast<int_fast16_t>(Cl2FillEnd - control);
 }
 
-size_t CountCl2FramePixels(const uint8_t *src, const uint8_t *srcEnd)
+IoError FrameWidthMismatchError(uint16_t width)
 {
-	size_t numPixels = 0;
+	return IoError { std::string("CL2 frame data does not match the frame width (")
+		                 .append(std::to_string(width))
+		                 .append(")") };
+}
+
+/**
+ * @brief Counts the pixels in the CL2 frame data and validates it against the frame width.
+ */
+std::optional<IoError> CountCl2FramePixels(const uint8_t *src, const uint8_t *srcEnd, uint16_t width, size_t &numPixels)
+{
+	numPixels = 0;
 	while (src != srcEnd) {
 		uint8_t val = *src++;
 		if (IsCl2Opaque(val)) {
 			if (IsCl2OpaqueFill(val)) {
-				numPixels += GetCl2OpaqueFillWidth(val);
+				if (src == srcEnd)
+					return IoError { "CL2 frame data is truncated" };
+				val = GetCl2OpaqueFillWidth(val);
 				++src;
 			} else {
 				val = GetCl2OpaquePixelsWidth(val);
-				numPixels += val;
+				if (val > srcEnd - src)
+					return IoError { "CL2 frame data is truncated" };
 				src += val;
 			}
-		} else {
-			numPixels += val;
+			// Only transparent runs can continue on the next line.
+			if (numPixels % width + val > width)
+				return FrameWidthMismatchError(width);
+		}
+		numPixels += val;
+	}
+	if (numPixels % width != 0)
+		return FrameWidthMismatchError(width);
+	return std::nullopt;
+}
+
+/**
+ * @brief Returns the size of the CL2 / CLX command at `src`.
+ */
+size_t GetCommandSize(const uint8_t *src)
+{
+	const uint8_t control = *src;
+	if (!IsClxOpaque(control))
+		return 1;
+	if (IsClxOpaqueFill(control))
+		return 2;
+	return 1 + static_cast<size_t>(GetClxOpaquePixelsWidth(control));
+}
+
+/**
+ * @brief A list of CL2 frames: frame count, frame offsets, frame data.
+ */
+struct Cl2Group {
+	size_t offset;
+	/** @brief The maximum size of the group (frame offsets must be within this). */
+	size_t size;
+	uint32_t numFrames;
+};
+
+std::optional<IoError> ValidateCl2Group(const uint8_t *data, Cl2Group &group)
+{
+	const uint8_t *groupBegin = &data[group.offset];
+	if (group.size < 8)
+		return IoError { "CL2 data is truncated" };
+	group.numFrames = LoadLE32(groupBegin);
+	const uint64_t headerSize = 4 * (static_cast<uint64_t>(group.numFrames) + 2);
+	if (headerSize > group.size)
+		return IoError { "CL2 frame count is out of bounds" };
+	uint32_t prevOffset = LoadLE32(&groupBegin[4]);
+	if (prevOffset < headerSize)
+		return IoError { "CL2 frame offset is out of bounds" };
+	for (uint32_t frame = 1; frame <= group.numFrames; ++frame) {
+		const uint32_t offset = LoadLE32(&groupBegin[4 * (frame + 1)]);
+		if (offset < prevOffset || offset > group.size)
+			return IoError { "CL2 frame offset is out of bounds" };
+		if (offset - prevOffset < 2 || LoadLE16(&groupBegin[prevOffset]) > offset - prevOffset)
+			return IoError { "CL2 frame header is out of bounds" };
+		prevOffset = offset;
+	}
+	return std::nullopt;
+}
+
+struct Cl2Layout {
+	std::vector<Cl2Group> groups;
+
+	/**
+	 * @brief Whether the CL2 starts with a list of group offsets (converted to a CLX sheet).
+	 *
+	 * If false, the CL2 is a single list of frames (converted to a CLX list).
+	 */
+	bool isGrouped;
+};
+
+/**
+ * @brief Parses and validates the structure of a CL2 file.
+ */
+std::optional<IoError> GetCl2Layout(const uint8_t *data, size_t size, Cl2Layout &layout)
+{
+	if (size < 8)
+		return IoError { "CL2 data is truncated" };
+	const uint32_t maybeNumFrames = LoadLE32(data);
+	const uint64_t maybeLastFrameOffsetPos = 4 * static_cast<uint64_t>(maybeNumFrames) + 4;
+
+	// If it is a number of frames, then the last frame offset will be equal to the size of the file.
+	if (maybeLastFrameOffsetPos + 4 <= size && LoadLE32(&data[maybeLastFrameOffsetPos]) == size) {
+		layout.isGrouped = false;
+		layout.groups.push_back(Cl2Group { 0, size, 0 });
+	} else {
+		// maybeNumFrames is the address of the first group, right after
+		// the list of group offsets.
+		layout.isGrouped = true;
+		const uint32_t headerSize = maybeNumFrames;
+		if (headerSize == 0 || headerSize % 4 != 0 || headerSize > size)
+			return IoError { "Invalid CL2 header" };
+		const uint32_t numGroups = headerSize / 4;
+		for (uint32_t i = 0; i < numGroups; ++i) {
+			// The frame offsets of all groups come first, followed by the frame data of all groups.
+			// Frame offsets are relative to the start of the group, so a group spans until the end of the file.
+			const uint32_t begin = LoadLE32(&data[4 * i]);
+			if (begin < headerSize || begin > size)
+				return IoError { "CL2 group offset is out of bounds" };
+			layout.groups.push_back(Cl2Group { begin, size - begin, 0 });
 		}
 	}
-	return numPixels;
+	for (Cl2Group &group : layout.groups) {
+		if (std::optional<IoError> error = ValidateCl2Group(data, group); error.has_value())
+			return error;
+	}
+	return std::nullopt;
+}
+
+std::optional<IoError> GetFrameWidth(const uint16_t *widths, size_t numWidths, size_t frame, uint16_t &width)
+{
+	if (numWidths == 0)
+		return IoError { "Frame width is required" };
+	if (numWidths != 1 && frame > numWidths) {
+		return IoError { std::string("Not enough frame widths: got ")
+			                 .append(std::to_string(numWidths))
+			                 .append(", frame count is at least ")
+			                 .append(std::to_string(frame)) };
+	}
+	width = numWidths == 1 ? *widths : widths[frame - 1];
+	if (width == 0)
+		return IoError { "Frame width must not be 0" };
+	return std::nullopt;
 }
 
 struct SkipSize {
@@ -78,31 +209,21 @@ std::optional<IoError> Cl2ToClx(const uint8_t *data, size_t size,
     const uint16_t *widths, size_t numWidths,
     std::vector<uint8_t> &clxData)
 {
-	uint32_t numGroups = 1;
-	const uint32_t maybeNumFrames = LoadLE32(data);
-	const uint8_t *groupBegin = data;
-
-	// If it is a number of frames, then the last frame offset will be equal to the size of the file.
-	if (LoadLE32(&data[maybeNumFrames * 4 + 4]) != size) {
-		// maybeNumFrames is the address of the first group, right after
-		// the list of group offsets.
-		numGroups = maybeNumFrames / 4;
-		clxData.resize(maybeNumFrames);
-	}
+	Cl2Layout cl2;
+	if (std::optional<IoError> error = GetCl2Layout(data, size, cl2); error.has_value())
+		return error;
+	if (cl2.isGrouped)
+		clxData.resize(ClxSheetHeaderSize(cl2.groups.size()));
 
 	// Transient buffer for a contiguous run of non-transparent pixels.
 	std::vector<uint8_t> pixels;
 	pixels.reserve(4096);
 
-	for (size_t group = 0; group < numGroups; ++group) {
-		uint32_t numFrames;
-		if (numGroups == 1) {
-			numFrames = maybeNumFrames;
-		} else {
-			groupBegin = &data[LoadLE32(&data[group * 4])];
-			numFrames = LoadLE32(groupBegin);
-			WriteLE32(&clxData[4 * group], clxData.size());
-		}
+	for (size_t group = 0; group < cl2.groups.size(); ++group) {
+		const uint8_t *groupBegin = &data[cl2.groups[group].offset];
+		const uint32_t numFrames = cl2.groups[group].numFrames;
+		if (cl2.isGrouped)
+			ClxSheetHeaderSetListOffset(group, static_cast<uint32_t>(clxData.size()), clxData.data());
 
 		// CLX header: frame count, frame offset for each frame, file size
 		const size_t clxDataOffset = clxData.size();
@@ -117,7 +238,9 @@ std::optional<IoError> Cl2ToClx(const uint8_t *data, size_t size,
 			const uint8_t *frameBegin = frameEnd;
 			frameEnd = &groupBegin[LoadLE32(&groupBegin[4 * (frame + 1)])];
 
-			const uint16_t frameWidth = numWidths == 1 ? *widths : widths[frame - 1];
+			uint16_t frameWidth;
+			if (std::optional<IoError> error = GetFrameWidth(widths, numWidths, frame, frameWidth); error.has_value())
+				return error;
 
 			const size_t frameHeaderPos = clxData.size();
 			clxData.resize(clxData.size() + ClxFrameHeaderSize);
@@ -131,6 +254,10 @@ std::optional<IoError> Cl2ToClx(const uint8_t *data, size_t size,
 			while (src != frameEnd) {
 				auto remainingWidth = static_cast<int_fast16_t>(frameWidth) - xOffset;
 				while (remainingWidth > 0) {
+					if (src == frameEnd)
+						return FrameWidthMismatchError(frameWidth);
+					if (GetCommandSize(src) > static_cast<size_t>(frameEnd - src))
+						return IoError { "CL2 frame data is truncated" };
 					const ClxBlitCommand cmd = ClxGetBlitCommand(src);
 					switch (cmd.type) {
 					case ClxBlitType::Transparent:
@@ -143,6 +270,10 @@ std::optional<IoError> Cl2ToClx(const uint8_t *data, size_t size,
 						break;
 					case ClxBlitType::Fill:
 					case ClxBlitType::Pixels:
+						// Only transparent runs can continue on the next line (both in CL2 and CLX).
+						if (static_cast<int_fast16_t>(cmd.length) > remainingWidth)
+							return FrameWidthMismatchError(frameWidth);
+
 						AppendClxTransparentRun(transparentRunWidth, clxData);
 						transparentRunWidth = 0;
 
@@ -174,10 +305,10 @@ std::optional<IoError> Cl2ToClx(const uint8_t *data, size_t size,
 					xOffset = 0;
 				}
 			}
-			if (!pixels.empty()) {
-				AppendClxPixelsOrFillRun(pixels.data(), pixels.size(), clxData);
-				pixels.clear();
-			}
+			if (xOffset != 0)
+				return FrameWidthMismatchError(frameWidth);
+			if (frameHeight > std::numeric_limits<uint16_t>::max())
+				return IoError { "CL2 frame is too tall" };
 			AppendClxTransparentRun(transparentRunWidth, clxData);
 
 			WriteLE16(&clxData[frameHeaderPos + 4], frameHeight);
@@ -191,34 +322,32 @@ std::optional<IoError> Cl2ToClx(const uint8_t *data, size_t size,
 std::optional<IoError> Cl2ToClxNoReencode(uint8_t *data, size_t size,
     const uint16_t *widths, size_t numWidths)
 {
-	uint32_t numGroups = 1;
-	const uint32_t maybeNumFrames = LoadLE32(data);
-	uint8_t *groupBegin = data;
+	Cl2Layout cl2;
+	if (std::optional<IoError> error = GetCl2Layout(data, size, cl2); error.has_value())
+		return error;
 
-	// If it is a number of frames, then the last frame offset will be equal to the size of the file.
-	if (LoadLE32(&data[maybeNumFrames * 4 + 4]) != size) {
-		// maybeNumFrames is the address of the first group, right after
-		// the list of group offsets.
-		numGroups = maybeNumFrames / 4;
-	}
-
-	for (size_t group = 0; group < numGroups; ++group) {
-		uint32_t numFrames;
-		if (numGroups == 1) {
-			numFrames = maybeNumFrames;
-		} else {
-			groupBegin = &data[LoadLE32(&data[group * 4])];
-			numFrames = LoadLE32(groupBegin);
-		}
-
+	for (const Cl2Group &group : cl2.groups) {
+		uint8_t *groupBegin = &data[group.offset];
 		uint8_t *frameEnd = &groupBegin[LoadLE32(&groupBegin[4])];
-		for (size_t frame = 1; frame <= numFrames; ++frame) {
+		for (size_t frame = 1; frame <= group.numFrames; ++frame) {
 			uint8_t *frameBegin = frameEnd;
 			frameEnd = &groupBegin[LoadLE32(&groupBegin[4 * (frame + 1)])];
 
-			const size_t numPixels = CountCl2FramePixels(frameBegin + LoadLE16(frameBegin), frameEnd);
+			// The CL2 frame header is 10 bytes, which we overwrite with the CLX frame header (padded).
+			constexpr uint16_t Cl2FrameHeaderSize = 10;
+			if (LoadLE16(frameBegin) < Cl2FrameHeaderSize)
+				return IoError { "CL2 frame header is too small" };
 
-			const uint16_t frameWidth = numWidths == 1 ? *widths : widths[frame - 1];
+			uint16_t frameWidth;
+			if (std::optional<IoError> error = GetFrameWidth(widths, numWidths, frame, frameWidth); error.has_value())
+				return error;
+			size_t numPixels;
+			if (std::optional<IoError> error = CountCl2FramePixels(frameBegin + LoadLE16(frameBegin), frameEnd, frameWidth, numPixels);
+			    error.has_value()) {
+				return error;
+			}
+			if (numPixels / frameWidth > std::numeric_limits<uint16_t>::max())
+				return IoError { "CL2 frame is too tall" };
 			const uint16_t frameHeight = numPixels / frameWidth;
 			WriteLE16(&frameBegin[2], frameWidth);
 			WriteLE16(&frameBegin[4], frameHeight);
@@ -310,6 +439,17 @@ std::optional<IoError> CombineCl2AsClxSheet(
 			};
 		}
 		input.close();
+
+		Cl2Layout cl2;
+		if (std::optional<IoError> error = GetCl2Layout(&ownedData[offsets[i]], offsets[i + 1] - offsets[i], cl2);
+		    error.has_value()) {
+			error->message.append(": ").append(inputPaths[i]);
+			return error;
+		}
+		if (cl2.isGrouped) {
+			return IoError { std::string("Only CL2 files with a single list of frames can be combined: ")
+				                 .append(inputPaths[i]) };
+		}
 	}
 
 	std::ofstream output;
